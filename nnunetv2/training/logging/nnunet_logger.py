@@ -21,6 +21,8 @@ class nnUNetLogger(object):
             'dice_per_class_or_region': list(),
             'train_losses': list(),
             'val_losses': list(),
+            'val_class_losses': list(),
+            'val_seg_losses': list(),
             'lrs': list(),
             'epoch_start_timestamps': list(),
             'epoch_end_timestamps': list()
@@ -62,6 +64,10 @@ class nnUNetLogger(object):
         x_values = list(range(epoch + 1))
         ax.plot(x_values, self.my_fantastic_logging['train_losses'][:epoch + 1], color='b', ls='-', label="loss_tr", linewidth=4)
         ax.plot(x_values, self.my_fantastic_logging['val_losses'][:epoch + 1], color='r', ls='-', label="loss_val", linewidth=4)
+        ax.plot(x_values, self.my_fantastic_logging['val_seg_losses'][:epoch + 1], color='r', ls='dotted', label="loss_val",
+                linewidth=4)
+        ax.plot(x_values, self.my_fantastic_logging['val_class_losses'][:epoch + 1], color='r', ls='dashed', label="loss_val",
+                linewidth=4)
         ax2.plot(x_values, self.my_fantastic_logging['mean_fg_dice'][:epoch + 1], color='g', ls='dotted', label="pseudo dice",
                  linewidth=3)
         ax2.plot(x_values, self.my_fantastic_logging['ema_fg_dice'][:epoch + 1], color='g', ls='-', label="pseudo dice (mov. avg.)",

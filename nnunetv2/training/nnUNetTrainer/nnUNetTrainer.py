@@ -933,6 +933,14 @@ class nnUNetTrainer(object):
 
         # print(f"batch size: {self.batch_size}")
         # print(f"oversample: {self.oversample_foreground_percent}")
+        self.single_head_loss = "segmentation"
+        # turn off classification, turn on segmentation
+        for param in self.network.encoder.parameters():
+            param.requires_grad = True
+        for param in self.network.decoder.parameters():
+            param.requires_grad = True
+        for param in self.network.classification_decoder.parameters():
+            param.requires_grad = False
 
     def on_train_end(self):
         # dirty hack because on_epoch_end increments the epoch counter and this is executed afterwards.
@@ -970,15 +978,31 @@ class nnUNetTrainer(object):
         # lrs are the same for all workers so we don't need to gather them in case of DDP training
         self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
 
+        training_percentage = self.current_epoch / self.num_epochs
+        if self.single_head_loss == "segmentation" and training_percentage >= 0.4:
+            self.single_head_loss = "classification"
+            # turn off segmentation grad, turn on classification grad
+            for param in self.network.encoder.parameters():
+                param.requires_grad = False
+            for param in self.network.decoder.parameters():
+                param.requires_grad = False
+            for param in self.network.classification_decoder.parameters():
+                param.requires_grad = True
+
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
-        target = batch['target']
+        seg = batch['target']
+        expected_classifications = torch.Tensor([int(x.split('_')[1]) for x in batch['keys']]).to(self.device)
+        target = {
+            'segmentation': [x.to(self.device) for x in seg],  # Segmentation labels. Move to device
+            'classification': expected_classifications
+        }
 
         data = data.to(self.device, non_blocking=True)
-        if isinstance(target, list):
-            target = [i.to(self.device, non_blocking=True) for i in target]
-        else:
-            target = target.to(self.device, non_blocking=True)
+        # if isinstance(target, list):
+        #     target = [i.to(self.device, non_blocking=True) for i in target]
+        # else:
+        #     target = target.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
         # Autocast can be annoying
@@ -988,7 +1012,7 @@ class nnUNetTrainer(object):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
             # del data
-            l = self.loss(output, target)
+            l = self.loss(output, target, single_head_loss=self.single_head_loss)
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1019,13 +1043,16 @@ class nnUNetTrainer(object):
 
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
-        target = batch['target']
-
+        seg = batch['target']
+        expected_classifications = torch.Tensor([int(x.split('_')[1]) for x in batch['keys']]).to(self.device)
+        target = {
+            'segmentation': [x.to(self.device) for x in seg],  # Segmentation labels. Move to device
+            'classification': expected_classifications
+        }
         data = data.to(self.device, non_blocking=True)
-        if isinstance(target, list):
-            target = [i.to(self.device, non_blocking=True) for i in target]
-        else:
-            target = target.to(self.device, non_blocking=True)
+
+        # if isinstance(target['segmentation'], list):
+        #     target['segmentation'] = target['segmentation'][0]
 
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
@@ -1034,12 +1061,12 @@ class nnUNetTrainer(object):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
             del data
-            l = self.loss(output, target)
+            l, l_seg, l_class = self.loss(output, target)
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
-            output = output[0]
-            target = target[0]
+            output = output['segmentation'][0]
+            target = target['segmentation'][0]
 
         # the following is needed for online evaluation. Fake dice (green line)
         axes = [0] + list(range(2, output.ndim))
@@ -1082,7 +1109,9 @@ class nnUNetTrainer(object):
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+        return {'loss': l.detach().cpu().numpy(), 'seg_loss': l_seg.detach().cpu().numpy(),
+                'class_loss': l_class.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard,
+                'fn_hard': fn_hard}
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
@@ -1108,14 +1137,26 @@ class nnUNetTrainer(object):
             losses_val = [None for _ in range(world_size)]
             dist.all_gather_object(losses_val, outputs_collated['loss'])
             loss_here = np.vstack(losses_val).mean()
+
+            seg_losses_val = [None for _ in range(world_size)]
+            dist.all_gather_object(seg_losses_val, outputs_collated['seg_loss'])
+            seg_loss_here = np.vstack(seg_losses_val).mean()
+
+            class_losses_val = [None for _ in range(world_size)]
+            dist.all_gather_object(class_losses_val, outputs_collated['class_loss'])
+            class_loss_here = np.vstack(class_losses_val).mean()
         else:
             loss_here = np.mean(outputs_collated['loss'])
+            seg_loss_here = np.mean(outputs_collated['seg_loss'])
+            class_loss_here = np.mean(outputs_collated['class_loss'])
 
         global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
         mean_fg_dice = np.nanmean(global_dc_per_class)
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
+        self.logger.log('val_seg_losses', seg_loss_here, self.current_epoch)
+        self.logger.log('val_class_losses', class_loss_here, self.current_epoch)
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
@@ -1125,6 +1166,10 @@ class nnUNetTrainer(object):
 
         self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
         self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
+        self.print_to_log_file('val_seg_loss',
+                               np.round(self.logger.my_fantastic_logging['val_seg_losses'][-1], decimals=4))
+        self.print_to_log_file('val_class_loss',
+                               np.round(self.logger.my_fantastic_logging['val_class_losses'][-1], decimals=4))
         self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
                                                self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
         self.print_to_log_file(
@@ -1139,6 +1184,11 @@ class nnUNetTrainer(object):
         if self._best_ema is None or self.logger.my_fantastic_logging['ema_fg_dice'][-1] > self._best_ema:
             self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
             self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
+            # self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
+
+        if self._best_val_loss is None or self.logger.my_fantastic_logging['val_losses'][-1] < self._best_val_loss:
+            self._best_val_loss = self.logger.my_fantastic_logging['val_losses'][-1]
+            self.print_to_log_file(f"Yayy! New best val Loss: {np.round(self._best_val_loss, decimals=4)}")
             self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
 
         if self.local_rank == 0:
